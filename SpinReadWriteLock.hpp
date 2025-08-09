@@ -37,6 +37,8 @@ namespace HSLL
 				{
 					count.fetch_sub(1, std::memory_order_relaxed);
 
+					std::this_thread::yield();
+
 					while (count.load(std::memory_order_relaxed) < 0)
 						std::this_thread::yield();
 
@@ -55,6 +57,14 @@ namespace HSLL
 				}
 
 				return true;
+			}
+
+			bool try_lock_read_check_before() noexcept
+			{
+				if (count.load(std::memory_order_relaxed) < 0)
+					return false;
+
+				return try_lock_read();
 			}
 
 			void unlock_read() noexcept
@@ -89,12 +99,9 @@ namespace HSLL
 		thread_local static int localIndex;
 		static std::atomic<unsigned int> globalIndex;
 
-		unsigned int get_local_index() noexcept
+		InnerLock& get_local_lock() noexcept
 		{
-			if (localIndex + 1)
-				return localIndex;
-			else
-				return	localIndex = globalIndex.fetch_add(1, std::memory_order_relaxed) % SPINREADWRITELOCK_MAXSLOTS;
+			return rwLocks[localIndex + 1 ? localIndex : (localIndex = globalIndex.fetch_add(1, std::memory_order_relaxed) % SPINREADWRITELOCK_MAXSLOTS)];
 		}
 
 		bool try_mark_write() noexcept
@@ -110,18 +117,23 @@ namespace HSLL
 			return true;
 		}
 
+		bool try_mark_write_check_before() noexcept
+		{
+			if (!flag.load(std::memory_order_relaxed))
+				return false;
+
+			return try_mark_write();
+		}
+
 		void mark_write() noexcept
 		{
-			bool old = true;
+			if (try_mark_write())
+				return;
 
-			while (!flag.compare_exchange_weak(old, false, std::memory_order_acquire, std::memory_order_relaxed))
-			{
+			std::this_thread::yield();
+
+			while (!try_mark_write_check_before())
 				std::this_thread::yield();
-				old = true;
-			}
-
-			for (int i = 0; i < SPINREADWRITELOCK_MAXSLOTS; ++i)
-				rwLocks[i].mark_write();
 		}
 
 		void unmark_write() noexcept
@@ -149,7 +161,7 @@ namespace HSLL
 
 		bool try_lock_read() noexcept
 		{
-			return rwLocks[get_local_index()].try_lock_read();
+			return get_local_lock().try_lock_read();
 		}
 
 		template <typename Rep, typename Period>
@@ -162,7 +174,14 @@ namespace HSLL
 		template <typename Clock, typename Duration>
 		bool try_lock_read_until(const std::chrono::time_point<Clock, Duration>& absTime) noexcept
 		{
-			while (!rwLocks[get_local_index()].try_lock_read())
+			InnerLock& lock = get_local_lock();
+
+			if (lock.try_lock_read())
+				return true;
+
+			std::this_thread::yield();
+
+			while (!lock.try_lock_read_check_before())
 			{
 				auto now = Clock::now();
 
@@ -177,12 +196,12 @@ namespace HSLL
 
 		void lock_read() noexcept
 		{
-			rwLocks[get_local_index()].lock_read();
+			get_local_lock().lock_read();
 		}
 
 		void unlock_read() noexcept
 		{
-			rwLocks[get_local_index()].unlock_read();
+			get_local_lock().unlock_read();
 		}
 
 		bool try_lock_write() noexcept
@@ -210,14 +229,19 @@ namespace HSLL
 		{
 			std::chrono::time_point<Clock, Duration> now;
 
-			while (!try_mark_write())
+			if (!try_mark_write())
 			{
-				now = Clock::now();
-
-				if (now >= absTime)
-					return false;
-
 				std::this_thread::yield();
+
+				while (!try_mark_write_check_before())
+				{
+					now = Clock::now();
+
+					if (now >= absTime)
+						return false;
+
+					std::this_thread::yield();
+				}
 			}
 
 			unsigned int nextCheckIndex = 0;

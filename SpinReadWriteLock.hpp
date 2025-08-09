@@ -91,7 +91,7 @@ namespace HSLL
 
 		unsigned int get_local_index() noexcept
 		{
-			if (localIndex != -1)
+			if (localIndex + 1)
 				return localIndex;
 			else
 				return	localIndex = globalIndex.fetch_add(1, std::memory_order_relaxed) % SPINREADWRITELOCK_MAXSLOTS;

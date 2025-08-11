@@ -74,7 +74,7 @@ namespace HSLL
 
 			bool mark_write() noexcept
 			{
-				return count.fetch_sub(SPINREADWRITELOCK_MAXREADER, std::memory_order_relaxed) ^ -SPINREADWRITELOCK_MAXREADER;
+				return !count.fetch_sub(SPINREADWRITELOCK_MAXREADER, std::memory_order_relaxed);
 			}
 
 			void unmark_write() noexcept
@@ -89,7 +89,7 @@ namespace HSLL
 
 			bool is_write_ready() noexcept
 			{
-				return count.load(std::memory_order_relaxed) ^ -SPINREADWRITELOCK_MAXREADER;
+				return count.load(std::memory_order_relaxed) == -SPINREADWRITELOCK_MAXREADER;
 			}
 		};
 

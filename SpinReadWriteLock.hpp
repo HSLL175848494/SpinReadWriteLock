@@ -93,58 +93,6 @@ namespace HSLL
 			}
 		};
 
-		class alignas(64) LocalReadLock
-		{
-			InnerLock& localLock;
-
-		public:
-
-			LocalReadLock(InnerLock& localLock) :localLock(localLock) {}
-
-			bool try_lock_read() noexcept
-			{
-				return localLock.try_lock_read();
-			}
-
-			template <typename Rep, typename Period>
-			bool try_lock_read_for(const std::chrono::duration<Rep, Period>& timeout) noexcept
-			{
-				auto absTime = std::chrono::steady_clock::now() + timeout;
-				return try_lock_read_until(absTime);
-			}
-
-			template <typename Clock, typename Duration>
-			bool try_lock_read_until(const std::chrono::time_point<Clock, Duration>& absTime) noexcept
-			{
-				if (localLock.try_lock_read())
-					return true;
-
-				std::this_thread::yield();
-
-				while (!localLock.try_lock_read_check_before())
-				{
-					auto now = Clock::now();
-
-					if (now >= absTime)
-						return false;
-
-					std::this_thread::yield();
-				}
-
-				return true;
-			}
-
-			void lock_read() noexcept
-			{
-				localLock.lock_read();
-			}
-
-			void unlock_read() noexcept
-			{
-				localLock.unlock_read();
-			}
-		};
-
 		std::atomic<bool> flag;
 		InnerLock rwLocks[SPINREADWRITELOCK_MAXSLOTS];
 
@@ -209,15 +157,67 @@ namespace HSLL
 			return index;
 		}
 
-		LocalReadLock get_local_lock() noexcept
-		{
-			return rwLocks[localIndex + 1 ? localIndex : (localIndex = globalIndex.fetch_add(1, std::memory_order_relaxed) % SPINREADWRITELOCK_MAXSLOTS)];
-		}
-
-
 	public:
 
+		class alignas(64) LocalReadLock
+		{
+			InnerLock& localLock;
+
+		public:
+
+			explicit LocalReadLock(InnerLock& localLock) noexcept :localLock(localLock) {}
+
+			bool try_lock_read() noexcept
+			{
+				return localLock.try_lock_read();
+			}
+
+			template <typename Rep, typename Period>
+			bool try_lock_read_for(const std::chrono::duration<Rep, Period>& timeout) noexcept
+			{
+				auto absTime = std::chrono::steady_clock::now() + timeout;
+				return try_lock_read_until(absTime);
+			}
+
+			template <typename Clock, typename Duration>
+			bool try_lock_read_until(const std::chrono::time_point<Clock, Duration>& absTime) noexcept
+			{
+				if (localLock.try_lock_read())
+					return true;
+
+				std::this_thread::yield();
+
+				while (!localLock.try_lock_read_check_before())
+				{
+					auto now = Clock::now();
+
+					if (now >= absTime)
+						return false;
+
+					std::this_thread::yield();
+				}
+
+				return true;
+			}
+
+			void lock_read() noexcept
+			{
+				localLock.lock_read();
+			}
+
+			void unlock_read() noexcept
+			{
+				localLock.unlock_read();
+			}
+		};
+
 		SpinReadWriteLock() noexcept :flag(true) {}
+
+		LocalReadLock get_local_lock() noexcept
+		{
+			return LocalReadLock(rwLocks[localIndex + 1 ?
+				localIndex : (localIndex = globalIndex.fetch_add(1, std::memory_order_relaxed) % SPINREADWRITELOCK_MAXSLOTS)]);
+		}
 
 		bool try_lock_read() noexcept
 		{
@@ -355,6 +355,28 @@ namespace HSLL
 
 		ReadLockGuard(const ReadLockGuard&) = delete;
 		ReadLockGuard& operator=(const ReadLockGuard&) = delete;
+	};
+
+	class LocalReadLockGuard
+	{
+	private:
+
+		SpinReadWriteLock::LocalReadLock& lock;
+
+	public:
+
+		explicit LocalReadLockGuard(SpinReadWriteLock::LocalReadLock& lock) noexcept : lock(lock)
+		{
+			lock.lock_read();
+		}
+
+		~LocalReadLockGuard() noexcept
+		{
+			lock.unlock_read();
+		}
+
+		LocalReadLockGuard(const LocalReadLockGuard&) = delete;
+		LocalReadLockGuard& operator=(const LocalReadLockGuard&) = delete;
 	};
 
 	class WriteLockGuard

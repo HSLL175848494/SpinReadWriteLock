@@ -93,16 +93,63 @@ namespace HSLL
 			}
 		};
 
+		class alignas(64) LocalReadLock
+		{
+			InnerLock& localLock;
+
+		public:
+
+			LocalReadLock(InnerLock& localLock) :localLock(localLock) {}
+
+			bool try_lock_read() noexcept
+			{
+				return localLock.try_lock_read();
+			}
+
+			template <typename Rep, typename Period>
+			bool try_lock_read_for(const std::chrono::duration<Rep, Period>& timeout) noexcept
+			{
+				auto absTime = std::chrono::steady_clock::now() + timeout;
+				return try_lock_read_until(absTime);
+			}
+
+			template <typename Clock, typename Duration>
+			bool try_lock_read_until(const std::chrono::time_point<Clock, Duration>& absTime) noexcept
+			{
+				if (localLock.try_lock_read())
+					return true;
+
+				std::this_thread::yield();
+
+				while (!localLock.try_lock_read_check_before())
+				{
+					auto now = Clock::now();
+
+					if (now >= absTime)
+						return false;
+
+					std::this_thread::yield();
+				}
+
+				return true;
+			}
+
+			void lock_read() noexcept
+			{
+				localLock.lock_read();
+			}
+
+			void unlock_read() noexcept
+			{
+				localLock.unlock_read();
+			}
+		};
+
 		std::atomic<bool> flag;
 		InnerLock rwLocks[SPINREADWRITELOCK_MAXSLOTS];
 
 		thread_local static long long localIndex;
 		static std::atomic<long long> globalIndex;
-
-		InnerLock& get_local_lock() noexcept
-		{
-			return rwLocks[localIndex + 1 ? localIndex : (localIndex = globalIndex.fetch_add(1, std::memory_order_relaxed) % SPINREADWRITELOCK_MAXSLOTS)];
-		}
 
 		bool try_mark_write(bool flagArray[SPINREADWRITELOCK_MAXSLOTS]) noexcept
 		{
@@ -162,6 +209,12 @@ namespace HSLL
 			return index;
 		}
 
+		LocalReadLock get_local_lock() noexcept
+		{
+			return rwLocks[localIndex + 1 ? localIndex : (localIndex = globalIndex.fetch_add(1, std::memory_order_relaxed) % SPINREADWRITELOCK_MAXSLOTS)];
+		}
+
+
 	public:
 
 		SpinReadWriteLock() noexcept :flag(true) {}
@@ -174,31 +227,13 @@ namespace HSLL
 		template <typename Rep, typename Period>
 		bool try_lock_read_for(const std::chrono::duration<Rep, Period>& timeout) noexcept
 		{
-			auto absTime = std::chrono::steady_clock::now() + timeout;
-			return try_lock_read_until(absTime);
+			return get_local_lock().try_lock_read_for(timeout);
 		}
 
 		template <typename Clock, typename Duration>
 		bool try_lock_read_until(const std::chrono::time_point<Clock, Duration>& absTime) noexcept
 		{
-			InnerLock& lock = get_local_lock();
-
-			if (lock.try_lock_read())
-				return true;
-
-			std::this_thread::yield();
-
-			while (!lock.try_lock_read_check_before())
-			{
-				auto now = Clock::now();
-
-				if (now >= absTime)
-					return false;
-
-				std::this_thread::yield();
-			}
-
-			return true;
+			return get_local_lock().try_lock_read_until(absTime);
 		}
 
 		void lock_read() noexcept

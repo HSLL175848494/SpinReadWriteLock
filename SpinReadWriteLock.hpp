@@ -6,490 +6,425 @@
 
 namespace HSLL
 {
-	constexpr intptr_t SPINREADWRITELOCK_MAXSLOTS = 32;
-	constexpr intptr_t UNIQUEREADWRITELOCK_MAXSLOTS = 32;
-	constexpr intptr_t SPINREADWRITELOCK_MAXREADER = (sizeof(intptr_t) == 4 ? (1 << 30) : (1LL << 62));
-
-	static_assert(SPINREADWRITELOCK_MAXSLOTS > 0, "SPINREADWRITELOCK_MAXSLOTS must be > 0");
-	static_assert(UNIQUEREADWRITELOCK_MAXSLOTS > 0, "UNIQUEREADWRITELOCK_MAXSLOTS must be > 0");
-	static_assert(SPINREADWRITELOCK_MAXREADER > 0 && SPINREADWRITELOCK_MAXREADER <= (sizeof(intptr_t) == 4 ? (1 << 30) : (1LL << 62)),
-		"SPINREADWRITELOCK_MAXREADER must be > 0 and <= (2^30 for 32-bit, 2^62 for 64-bit)");
-
-	/**
-	* @brief Efficient spin lock based on atomic variables, suitable for scenarios where reads significantly outnumber writes
-	*/
-	class SpinReadWriteLock
+	namespace INNER
 	{
-	private:
+		constexpr intptr_t SPINREADWRITELOCK_MAXSLOTS = 32;
+		constexpr intptr_t SPINREADWRITELOCK_MAXREADER = (sizeof(intptr_t) == 4 ? (1 << 30) : (1LL << 62));
 
-		class alignas(64) InnerLock
+		static_assert(SPINREADWRITELOCK_MAXSLOTS > 0, "SPINREADWRITELOCK_MAXSLOTS must be > 0");
+		static_assert(SPINREADWRITELOCK_MAXREADER > 0 && SPINREADWRITELOCK_MAXREADER <= (sizeof(intptr_t) == 4 ? (1 << 30) : (1LL << 62)),
+			"SPINREADWRITELOCK_MAXREADER must be > 0 and <= (2^30 for 32-bit, 2^62 for 64-bit)");
+
+		/**
+		* @brief Efficient spin lock based on atomic variables, suitable for scenarios where reads significantly outnumber writes
+		*/
+		class SpinReadWriteLock
 		{
 		private:
-			std::atomic<intptr_t> count;
 
-		public:
-
-			InnerLock() noexcept :count(0) {}
-
-			void lock_read() noexcept
+			class alignas(64) InnerLock
 			{
-				intptr_t old = count.fetch_add(1, std::memory_order_acquire);
+			private:
+				std::atomic<intptr_t> count;
 
-				while (old < 0)
+			public:
+
+				InnerLock() noexcept :count(0) {}
+
+				void lock_read() noexcept
+				{
+					intptr_t old = count.fetch_add(1, std::memory_order_acquire);
+
+					while (old < 0)
+					{
+						count.fetch_sub(1, std::memory_order_relaxed);
+
+						std::this_thread::yield();
+
+						while (count.load(std::memory_order_relaxed) < 0)
+							std::this_thread::yield();
+
+						old = count.fetch_add(1, std::memory_order_acquire);
+					}
+				}
+
+				bool try_lock_read() noexcept
+				{
+					intptr_t old = count.fetch_add(1, std::memory_order_acquire);
+
+					if (old < 0)
+					{
+						count.fetch_sub(1, std::memory_order_relaxed);
+						return false;
+					}
+
+					return true;
+				}
+
+				bool try_lock_read_check_before() noexcept
+				{
+					if (count.load(std::memory_order_relaxed) < 0)
+						return false;
+
+					return try_lock_read();
+				}
+
+				void unlock_read() noexcept
 				{
 					count.fetch_sub(1, std::memory_order_relaxed);
+				}
+
+				bool mark_write() noexcept
+				{
+					return !count.fetch_sub(SPINREADWRITELOCK_MAXREADER, std::memory_order_relaxed);
+				}
+
+				void unmark_write(bool ready) noexcept
+				{
+					if (ready)
+						count.store(0, std::memory_order_relaxed);
+					else
+						count.fetch_add(SPINREADWRITELOCK_MAXREADER, std::memory_order_relaxed);
+				}
+
+				void unlock_write() noexcept
+				{
+					count.store(0, std::memory_order_release);
+				}
+
+				bool is_write_ready() noexcept
+				{
+					return count.load(std::memory_order_relaxed) == -SPINREADWRITELOCK_MAXREADER;
+				}
+			};
+
+			class LocalReadLock
+			{
+				InnerLock& localLock;
+
+			public:
+
+				explicit LocalReadLock(InnerLock& localLock) noexcept :localLock(localLock) {}
+
+				bool try_lock_read() noexcept
+				{
+					return localLock.try_lock_read();
+				}
+
+				template <typename Rep, typename Period>
+				bool try_lock_read_for(const std::chrono::duration<Rep, Period>& timeout) noexcept
+				{
+					auto absTime = std::chrono::steady_clock::now() + timeout;
+					return try_lock_read_until(absTime);
+				}
+
+				template <typename Clock, typename Duration>
+				bool try_lock_read_until(const std::chrono::time_point<Clock, Duration>& absTime) noexcept
+				{
+					if (localLock.try_lock_read())
+						return true;
 
 					std::this_thread::yield();
 
-					while (count.load(std::memory_order_relaxed) < 0)
-						std::this_thread::yield();
+					while (!localLock.try_lock_read_check_before())
+					{
+						auto now = Clock::now();
 
-					old = count.fetch_add(1, std::memory_order_acquire);
+						if (now >= absTime)
+							return false;
+
+						std::this_thread::yield();
+					}
+
+					return true;
 				}
+
+				void lock_read() noexcept
+				{
+					localLock.lock_read();
+				}
+
+				void unlock_read() noexcept
+				{
+					localLock.unlock_read();
+				}
+			};
+
+			std::atomic<bool> flag;
+			InnerLock rwLocks[SPINREADWRITELOCK_MAXSLOTS];
+
+			thread_local static intptr_t localIndex;
+			static std::atomic<intptr_t> globalIndex;
+
+			inline LocalReadLock get_local_lock() noexcept
+			{
+				intptr_t index = localIndex;
+
+				if (index == -1)
+					index = localIndex = globalIndex.fetch_add(1, std::memory_order_relaxed) % SPINREADWRITELOCK_MAXSLOTS;
+
+				return LocalReadLock(rwLocks[index]);
 			}
 
-			bool try_lock_read() noexcept
+			bool try_mark_write(bool flagArray[SPINREADWRITELOCK_MAXSLOTS]) noexcept
 			{
-				intptr_t old = count.fetch_add(1, std::memory_order_acquire);
+				bool old = true;
 
-				if (old < 0)
-				{
-					count.fetch_sub(1, std::memory_order_relaxed);
+				if (!flag.compare_exchange_strong(old, false, std::memory_order_acquire, std::memory_order_relaxed))
 					return false;
-				}
+
+				for (intptr_t i = 0; i < SPINREADWRITELOCK_MAXSLOTS; ++i)
+					flagArray[i] = rwLocks[i].mark_write();
 
 				return true;
 			}
 
-			bool try_lock_read_check_before() noexcept
+			bool try_mark_write_check_before(bool flagArray[SPINREADWRITELOCK_MAXSLOTS]) noexcept
 			{
-				if (count.load(std::memory_order_relaxed) < 0)
+				if (!flag.load(std::memory_order_relaxed))
 					return false;
 
-				return try_lock_read();
+				return try_mark_write(flagArray);
 			}
 
-			void unlock_read() noexcept
+			void mark_write(bool flagArray[SPINREADWRITELOCK_MAXSLOTS]) noexcept
 			{
-				count.fetch_sub(1, std::memory_order_relaxed);
+				if (try_mark_write(flagArray))
+					return;
+
+				std::this_thread::yield();
+
+				while (!try_mark_write_check_before(flagArray))
+					std::this_thread::yield();
 			}
 
-			bool mark_write() noexcept
+			void unmark_write(bool flagArray[SPINREADWRITELOCK_MAXSLOTS]) noexcept
 			{
-				return !count.fetch_sub(SPINREADWRITELOCK_MAXREADER, std::memory_order_relaxed);
+				for (intptr_t i = 0; i < SPINREADWRITELOCK_MAXSLOTS; ++i)
+					rwLocks[i].unmark_write(flagArray[i]);
+
+				flag.store(true, std::memory_order_relaxed);
 			}
 
-			void unmark_write(bool ready) noexcept
+			intptr_t ready_count(intptr_t startIndex, bool flagArray[SPINREADWRITELOCK_MAXSLOTS]) noexcept
 			{
-				if (ready)
-					count.store(0, std::memory_order_relaxed);
-				else
-					count.fetch_add(SPINREADWRITELOCK_MAXREADER, std::memory_order_relaxed);
-			}
+				intptr_t index = SPINREADWRITELOCK_MAXSLOTS;
 
-			void unlock_write() noexcept
-			{
-				count.store(0, std::memory_order_release);
-			}
+				for (intptr_t i = startIndex; i < SPINREADWRITELOCK_MAXSLOTS; ++i)
+				{
+					if (flagArray[i])
+						continue;
 
-			bool is_write_ready() noexcept
-			{
-				return count.load(std::memory_order_relaxed) == -SPINREADWRITELOCK_MAXREADER;
-			}
-		};
+					flagArray[i] = rwLocks[i].is_write_ready();
 
-		class LocalReadLock
-		{
-			InnerLock& localLock;
+					if (!flagArray[i] && i < index)
+						index = i;
+				}
+
+				return index;
+			}
 
 		public:
 
-			explicit LocalReadLock(InnerLock& localLock) noexcept :localLock(localLock) {}
+			SpinReadWriteLock() noexcept :flag(true) {}
 
 			bool try_lock_read() noexcept
 			{
-				return localLock.try_lock_read();
+				return get_local_lock().try_lock_read();
 			}
 
 			template <typename Rep, typename Period>
 			bool try_lock_read_for(const std::chrono::duration<Rep, Period>& timeout) noexcept
 			{
-				auto absTime = std::chrono::steady_clock::now() + timeout;
-				return try_lock_read_until(absTime);
+				return get_local_lock().try_lock_read_for(timeout);
 			}
 
 			template <typename Clock, typename Duration>
 			bool try_lock_read_until(const std::chrono::time_point<Clock, Duration>& absTime) noexcept
 			{
-				if (localLock.try_lock_read())
-					return true;
-
-				std::this_thread::yield();
-
-				while (!localLock.try_lock_read_check_before())
-				{
-					auto now = Clock::now();
-
-					if (now >= absTime)
-						return false;
-
-					std::this_thread::yield();
-				}
-
-				return true;
+				return get_local_lock().try_lock_read_until(absTime);
 			}
 
 			void lock_read() noexcept
 			{
-				localLock.lock_read();
+				get_local_lock().lock_read();
 			}
 
 			void unlock_read() noexcept
 			{
-				localLock.unlock_read();
-			}
-		};
-
-		std::atomic<bool> flag;
-		InnerLock rwLocks[SPINREADWRITELOCK_MAXSLOTS];
-
-		thread_local static intptr_t localIndex;
-		static std::atomic<intptr_t> globalIndex;
-
-		inline LocalReadLock get_local_lock() noexcept
-		{
-			intptr_t index = localIndex;
-
-			if (index == -1)
-				index = localIndex = globalIndex.fetch_add(1, std::memory_order_relaxed) % SPINREADWRITELOCK_MAXSLOTS;
-
-			return LocalReadLock(rwLocks[index]);
-		}
-
-		bool try_mark_write(bool flagArray[SPINREADWRITELOCK_MAXSLOTS]) noexcept
-		{
-			bool old = true;
-
-			if (!flag.compare_exchange_strong(old, false, std::memory_order_acquire, std::memory_order_relaxed))
-				return false;
-
-			for (intptr_t i = 0; i < SPINREADWRITELOCK_MAXSLOTS; ++i)
-				flagArray[i] = rwLocks[i].mark_write();
-
-			return true;
-		}
-
-		bool try_mark_write_check_before(bool flagArray[SPINREADWRITELOCK_MAXSLOTS]) noexcept
-		{
-			if (!flag.load(std::memory_order_relaxed))
-				return false;
-
-			return try_mark_write(flagArray);
-		}
-
-		void mark_write(bool flagArray[SPINREADWRITELOCK_MAXSLOTS]) noexcept
-		{
-			if (try_mark_write(flagArray))
-				return;
-
-			std::this_thread::yield();
-
-			while (!try_mark_write_check_before(flagArray))
-				std::this_thread::yield();
-		}
-
-		void unmark_write(bool flagArray[SPINREADWRITELOCK_MAXSLOTS]) noexcept
-		{
-			for (intptr_t i = 0; i < SPINREADWRITELOCK_MAXSLOTS; ++i)
-				rwLocks[i].unmark_write(flagArray[i]);
-
-			flag.store(true, std::memory_order_relaxed);
-		}
-
-		intptr_t ready_count(intptr_t startIndex, bool flagArray[SPINREADWRITELOCK_MAXSLOTS]) noexcept
-		{
-			intptr_t index = SPINREADWRITELOCK_MAXSLOTS;
-
-			for (intptr_t i = startIndex; i < SPINREADWRITELOCK_MAXSLOTS; ++i)
-			{
-				if (flagArray[i])
-					continue;
-
-				flagArray[i] = rwLocks[i].is_write_ready();
-
-				if (!flagArray[i] && i < index)
-					index = i;
+				get_local_lock().unlock_read();
 			}
 
-			return index;
-		}
-
-	public:
-
-		SpinReadWriteLock() noexcept :flag(true) {}
-
-		bool try_lock_read() noexcept
-		{
-			return get_local_lock().try_lock_read();
-		}
-
-		template <typename Rep, typename Period>
-		bool try_lock_read_for(const std::chrono::duration<Rep, Period>& timeout) noexcept
-		{
-			return get_local_lock().try_lock_read_for(timeout);
-		}
-
-		template <typename Clock, typename Duration>
-		bool try_lock_read_until(const std::chrono::time_point<Clock, Duration>& absTime) noexcept
-		{
-			return get_local_lock().try_lock_read_until(absTime);
-		}
-
-		void lock_read() noexcept
-		{
-			get_local_lock().lock_read();
-		}
-
-		void unlock_read() noexcept
-		{
-			get_local_lock().unlock_read();
-		}
-
-		bool try_lock_write() noexcept
-		{
-			bool flagArray[SPINREADWRITELOCK_MAXSLOTS];
-
-			if (!try_mark_write(flagArray))
-				return false;
-
-			if (ready_count(0, flagArray) == SPINREADWRITELOCK_MAXSLOTS)
-				return true;
-			else
-				unmark_write(flagArray);
-
-			return false;
-		}
-
-		template <typename Rep, typename Period>
-		bool try_lock_write_for(const std::chrono::duration<Rep, Period>& timeout) noexcept
-		{
-			auto absTime = std::chrono::steady_clock::now() + timeout;
-			return try_lock_write_until(absTime);
-		}
-
-		template <typename Clock, typename Duration>
-		bool try_lock_write_until(const std::chrono::time_point<Clock, Duration>& absTime) noexcept
-		{
-			std::chrono::time_point<Clock, Duration> now;
-
-			bool flagArray[SPINREADWRITELOCK_MAXSLOTS];
-
-			if (!try_mark_write(flagArray))
+			bool try_lock_write() noexcept
 			{
-				std::this_thread::yield();
+				bool flagArray[SPINREADWRITELOCK_MAXSLOTS];
 
-				while (!try_mark_write_check_before(flagArray))
+				if (!try_mark_write(flagArray))
+					return false;
+
+				if (ready_count(0, flagArray) == SPINREADWRITELOCK_MAXSLOTS)
+					return true;
+				else
+					unmark_write(flagArray);
+
+				return false;
+			}
+
+			template <typename Rep, typename Period>
+			bool try_lock_write_for(const std::chrono::duration<Rep, Period>& timeout) noexcept
+			{
+				auto absTime = std::chrono::steady_clock::now() + timeout;
+				return try_lock_write_until(absTime);
+			}
+
+			template <typename Clock, typename Duration>
+			bool try_lock_write_until(const std::chrono::time_point<Clock, Duration>& absTime) noexcept
+			{
+				std::chrono::time_point<Clock, Duration> now;
+
+				bool flagArray[SPINREADWRITELOCK_MAXSLOTS];
+
+				if (!try_mark_write(flagArray))
+				{
+					std::this_thread::yield();
+
+					while (!try_mark_write_check_before(flagArray))
+					{
+						now = Clock::now();
+
+						if (now >= absTime)
+							return false;
+
+						std::this_thread::yield();
+					}
+				}
+
+				intptr_t nextCheckIndex = 0;
+
+				while ((nextCheckIndex = ready_count(nextCheckIndex, flagArray)) != SPINREADWRITELOCK_MAXSLOTS)
 				{
 					now = Clock::now();
 
 					if (now >= absTime)
+					{
+						unmark_write(flagArray);
 						return false;
+					}
 
 					std::this_thread::yield();
-				}
-			}
-
-			intptr_t nextCheckIndex = 0;
-
-			while ((nextCheckIndex = ready_count(nextCheckIndex, flagArray)) != SPINREADWRITELOCK_MAXSLOTS)
-			{
-				now = Clock::now();
-
-				if (now >= absTime)
-				{
-					unmark_write(flagArray);
-					return false;
-				}
-
-				std::this_thread::yield();
-			}
-
-			return true;
-		}
-
-		void lock_write() noexcept
-		{
-			bool flagArray[SPINREADWRITELOCK_MAXSLOTS];
-
-			mark_write(flagArray);
-
-			intptr_t nextCheckIndex = 0;
-
-			while ((nextCheckIndex = ready_count(nextCheckIndex, flagArray)) != SPINREADWRITELOCK_MAXSLOTS)
-				std::this_thread::yield();
-		}
-
-		void unlock_write() noexcept
-		{
-			for (intptr_t i = 0; i < SPINREADWRITELOCK_MAXSLOTS; ++i)
-				rwLocks[i].unlock_write();
-
-			flag.store(true, std::memory_order_release);
-		}
-
-		SpinReadWriteLock(const SpinReadWriteLock&) = delete;
-		SpinReadWriteLock& operator=(const SpinReadWriteLock&) = delete;
-	};
-
-	std::atomic<intptr_t> SpinReadWriteLock::globalIndex{ 0 };
-	thread_local intptr_t SpinReadWriteLock::localIndex{ -1 };
-
-	class UniqueReadWriteLock
-	{
-	private:
-
-		class alignas(64) InnerLock
-		{
-		private:
-			std::atomic<intptr_t> count;
-
-		public:
-
-			InnerLock() noexcept :count(0) {}
-
-			void lock_read() noexcept
-			{
-				intptr_t old = count.fetch_add(1, std::memory_order_acquire);
-
-				while (old < 0)
-				{
-					count.fetch_sub(1, std::memory_order_relaxed);
-
-					std::this_thread::yield();
-
-					while (count.load(std::memory_order_relaxed) < 0)
-						std::this_thread::yield();
-
-					old = count.fetch_add(1, std::memory_order_acquire);
-				}
-			}
-
-			bool try_lock_read() noexcept
-			{
-				intptr_t old = count.fetch_add(1, std::memory_order_acquire);
-
-				if (old < 0)
-				{
-					count.fetch_sub(1, std::memory_order_relaxed);
-					return false;
 				}
 
 				return true;
 			}
 
-			bool try_lock_read_check_before() noexcept
+			void lock_write() noexcept
 			{
-				if (count.load(std::memory_order_relaxed) < 0)
-					return false;
+				bool flagArray[SPINREADWRITELOCK_MAXSLOTS];
 
-				return try_lock_read();
-			}
+				mark_write(flagArray);
 
-			void unlock_read() noexcept
-			{
-				count.store(0, std::memory_order_relaxed);
-			}
+				intptr_t nextCheckIndex = 0;
 
-			bool mark_write() noexcept
-			{
-				return !count.fetch_sub(UNIQUEREADWRITELOCK_MAXSLOTS, std::memory_order_relaxed);
-			}
-
-			void unmark_write(bool ready) noexcept
-			{
-				if (ready)
-					count.store(0, std::memory_order_relaxed);
-				else
-					count.fetch_add(UNIQUEREADWRITELOCK_MAXSLOTS, std::memory_order_relaxed);
+				while ((nextCheckIndex = ready_count(nextCheckIndex, flagArray)) != SPINREADWRITELOCK_MAXSLOTS)
+					std::this_thread::yield();
 			}
 
 			void unlock_write() noexcept
 			{
-				count.store(0, std::memory_order_release);
+				for (intptr_t i = 0; i < SPINREADWRITELOCK_MAXSLOTS; ++i)
+					rwLocks[i].unlock_write();
+
+				flag.store(true, std::memory_order_release);
 			}
 
-			bool is_write_ready() noexcept
-			{
-				return count.load(std::memory_order_relaxed) == -UNIQUEREADWRITELOCK_MAXSLOTS;
-			}
+			SpinReadWriteLock(const SpinReadWriteLock&) = delete;
+			SpinReadWriteLock& operator=(const SpinReadWriteLock&) = delete;
 		};
 
-		std::atomic<bool> flag;
-		std::atomic<intptr_t> allocated;
-		InnerLock rwLocks[UNIQUEREADWRITELOCK_MAXSLOTS];
-
-		bool try_mark_write(bool flagArray[UNIQUEREADWRITELOCK_MAXSLOTS]) noexcept
-		{
-			bool old = true;
-
-			if (!flag.compare_exchange_strong(old, false, std::memory_order_acquire, std::memory_order_relaxed))
-				return false;
-
-			for (intptr_t i = 0; i < UNIQUEREADWRITELOCK_MAXSLOTS; ++i)
-				flagArray[i] = rwLocks[i].mark_write();
-
-			return true;
-		}
-
-		bool try_mark_write_check_before(bool flagArray[UNIQUEREADWRITELOCK_MAXSLOTS]) noexcept
-		{
-			if (!flag.load(std::memory_order_relaxed))
-				return false;
-
-			return try_mark_write(flagArray);
-		}
-
-		void mark_write(bool flagArray[UNIQUEREADWRITELOCK_MAXSLOTS]) noexcept
-		{
-			if (try_mark_write(flagArray))
-				return;
-
-			std::this_thread::yield();
-
-			while (!try_mark_write_check_before(flagArray))
-				std::this_thread::yield();
-		}
-
-		void unmark_write(bool flagArray[UNIQUEREADWRITELOCK_MAXSLOTS]) noexcept
-		{
-			for (intptr_t i = 0; i < UNIQUEREADWRITELOCK_MAXSLOTS; ++i)
-				rwLocks[i].unmark_write(flagArray[i]);
-
-			flag.store(true, std::memory_order_relaxed);
-		}
-
-		intptr_t ready_count(intptr_t startIndex, bool flagArray[UNIQUEREADWRITELOCK_MAXSLOTS]) noexcept
-		{
-			intptr_t index = UNIQUEREADWRITELOCK_MAXSLOTS;
-
-			for (intptr_t i = startIndex; i < UNIQUEREADWRITELOCK_MAXSLOTS; ++i)
-			{
-				if (flagArray[i])
-					continue;
-
-				flagArray[i] = rwLocks[i].is_write_ready();
-
-				if (!flagArray[i] && i < index)
-					index = i;
-			}
-
-			return index;
-		}
-
-	public:
+		std::atomic<intptr_t> SpinReadWriteLock::globalIndex{ 0 };
+		thread_local intptr_t SpinReadWriteLock::localIndex{ -1 };
 
 		class UniqueReadLock
 		{
+			template<intptr_t MAXSLOTS>
+			friend class UniqueReadWriteLock;
+
+			class alignas(64) InnerLock
+			{
+			private:
+				std::atomic<intptr_t> count;
+
+			public:
+
+				InnerLock() noexcept :count(0) {}
+
+				void lock_read() noexcept
+				{
+					intptr_t old = count.fetch_add(1, std::memory_order_acquire);
+
+					while (old < 0)
+					{
+						count.fetch_sub(1, std::memory_order_relaxed);
+
+						std::this_thread::yield();
+
+						while (count.load(std::memory_order_relaxed) < 0)
+							std::this_thread::yield();
+
+						old = count.fetch_add(1, std::memory_order_acquire);
+					}
+				}
+
+				bool try_lock_read() noexcept
+				{
+					intptr_t old = count.fetch_add(1, std::memory_order_acquire);
+
+					if (old < 0)
+					{
+						count.fetch_sub(1, std::memory_order_relaxed);
+						return false;
+					}
+
+					return true;
+				}
+
+				bool try_lock_read_check_before() noexcept
+				{
+					if (count.load(std::memory_order_relaxed) < 0)
+						return false;
+
+					return try_lock_read();
+				}
+
+				void unlock_read() noexcept
+				{
+					count.store(0, std::memory_order_relaxed);
+				}
+
+				bool mark_write() noexcept
+				{
+					return !count.fetch_sub(SPINREADWRITELOCK_MAXREADER, std::memory_order_relaxed);
+				}
+
+				void unmark_write(bool ready) noexcept
+				{
+					if (ready)
+						count.store(0, std::memory_order_relaxed);
+					else
+						count.fetch_add(SPINREADWRITELOCK_MAXREADER, std::memory_order_relaxed);
+				}
+
+				void unlock_write() noexcept
+				{
+					count.store(0, std::memory_order_release);
+				}
+
+				bool is_write_ready() noexcept
+				{
+					return count.load(std::memory_order_relaxed) == -SPINREADWRITELOCK_MAXREADER;
+				}
+			};
+
 			InnerLock& localLock;
 
 		public:
@@ -540,178 +475,284 @@ namespace HSLL
 			}
 		};
 
-		UniqueReadWriteLock() :flag(true), allocated(0) {}
-
-		UniqueReadLock get_unique_read_lock()
+		/*
+		* @brief Avoid specifying template parameters when using UniqueWriteLockGuard.
+		*/
+		class UniqueReadWriteLockBase
 		{
-			intptr_t old = allocated.fetch_add(1, std::memory_order_relaxed);
+		public:
+			virtual void lock_write() noexcept = 0;
+			virtual void unlock_write() noexcept = 0;
+			virtual ~UniqueReadWriteLockBase() {};
+		};
 
-			if (old < UNIQUEREADWRITELOCK_MAXSLOTS)
-				return UniqueReadLock(rwLocks[old]);
-
-			allocated.store(UNIQUEREADWRITELOCK_MAXSLOTS, std::memory_order_relaxed);
-
-			throw std::runtime_error("No available slots for UniqueReadLock");
-		}
-
-		template <typename Rep, typename Period>
-		bool try_lock_write_for(const std::chrono::duration<Rep, Period>& timeout) noexcept
+		template<intptr_t MAXSLOTS = 32>
+		class UniqueReadWriteLock :public UniqueReadWriteLockBase
 		{
-			auto absTime = std::chrono::steady_clock::now() + timeout;
-			return try_lock_write_until(absTime);
-		}
+			static_assert(MAXSLOTS > 0, "MAXSLOTS must be > 0");
 
-		template <typename Clock, typename Duration>
-		bool try_lock_write_until(const std::chrono::time_point<Clock, Duration>& absTime) noexcept
-		{
-			std::chrono::time_point<Clock, Duration> now;
+			using InnerLock = UniqueReadLock::InnerLock;
 
-			bool flagArray[UNIQUEREADWRITELOCK_MAXSLOTS];
+			std::atomic<bool> flag;
+			std::atomic<intptr_t> allocated;
+			UniqueReadLock::InnerLock rwLocks[MAXSLOTS];
 
-			if (!try_mark_write(flagArray))
+			bool try_mark_write(bool flagArray[MAXSLOTS]) noexcept
 			{
+				bool old = true;
+
+				if (!flag.compare_exchange_strong(old, false, std::memory_order_acquire, std::memory_order_relaxed))
+					return false;
+
+				for (intptr_t i = 0; i < MAXSLOTS; ++i)
+					flagArray[i] = rwLocks[i].mark_write();
+
+				return true;
+			}
+
+			bool try_mark_write_check_before(bool flagArray[MAXSLOTS]) noexcept
+			{
+				if (!flag.load(std::memory_order_relaxed))
+					return false;
+
+				return try_mark_write(flagArray);
+			}
+
+			void mark_write(bool flagArray[MAXSLOTS]) noexcept
+			{
+				if (try_mark_write(flagArray))
+					return;
+
 				std::this_thread::yield();
 
 				while (!try_mark_write_check_before(flagArray))
+					std::this_thread::yield();
+			}
+
+			void unmark_write(bool flagArray[MAXSLOTS]) noexcept
+			{
+				for (intptr_t i = 0; i < MAXSLOTS; ++i)
+					rwLocks[i].unmark_write(flagArray[i]);
+
+				flag.store(true, std::memory_order_relaxed);
+			}
+
+			intptr_t ready_count(intptr_t startIndex, bool flagArray[MAXSLOTS]) noexcept
+			{
+				intptr_t index = MAXSLOTS;
+
+				for (intptr_t i = startIndex; i < MAXSLOTS; ++i)
+				{
+					if (flagArray[i])
+						continue;
+
+					flagArray[i] = rwLocks[i].is_write_ready();
+
+					if (!flagArray[i] && i < index)
+						index = i;
+				}
+
+				return index;
+			}
+
+		public:
+
+			UniqueReadWriteLock() :flag(true), allocated(0) {}
+
+			/*
+			* @brief Acquires a unique read lock object
+			*
+			* This function allocates a dedicated read lock slot for the current call and returns a UniqueReadLock object
+			* that provides interfaces for read lock/unlock operations.
+			*
+			* Important Notes:
+			* 1. Call Limit: This function can be called at most MAXSLOTS times (equal to the total number of slots).
+			*    Subsequent calls will throw a std::runtime_error exception.
+			* 2. Thread Exclusivity: The returned UniqueReadLock object must be used exclusively by one thread.
+			*    Do NOT share the same UniqueReadLock instance across multiple threads - each thread must obtain its own instance.
+			*
+			* @return UniqueReadLock object providing exclusive read access
+			* @throw std::runtime_error when all slots are exhausted
+			*/
+			UniqueReadLock get_unique_read_lock()
+			{
+				intptr_t old = allocated.fetch_add(1, std::memory_order_relaxed);
+
+				if (old < MAXSLOTS)
+					return UniqueReadLock(rwLocks[old]);
+
+				allocated.store(MAXSLOTS, std::memory_order_relaxed);
+
+				throw std::runtime_error("No available slots for UniqueReadLock");
+			}
+
+			template <typename Rep, typename Period>
+			bool try_lock_write_for(const std::chrono::duration<Rep, Period>& timeout) noexcept
+			{
+				auto absTime = std::chrono::steady_clock::now() + timeout;
+				return try_lock_write_until(absTime);
+			}
+
+			template <typename Clock, typename Duration>
+			bool try_lock_write_until(const std::chrono::time_point<Clock, Duration>& absTime) noexcept
+			{
+				std::chrono::time_point<Clock, Duration> now;
+
+				bool flagArray[MAXSLOTS];
+
+				if (!try_mark_write(flagArray))
+				{
+					std::this_thread::yield();
+
+					while (!try_mark_write_check_before(flagArray))
+					{
+						now = Clock::now();
+
+						if (now >= absTime)
+							return false;
+
+						std::this_thread::yield();
+					}
+				}
+
+				intptr_t nextCheckIndex = 0;
+
+				while ((nextCheckIndex = ready_count(nextCheckIndex, flagArray)) != MAXSLOTS)
 				{
 					now = Clock::now();
 
 					if (now >= absTime)
+					{
+						unmark_write(flagArray);
 						return false;
+					}
 
 					std::this_thread::yield();
 				}
+
+				return true;
 			}
 
-			intptr_t nextCheckIndex = 0;
-
-			while ((nextCheckIndex = ready_count(nextCheckIndex, flagArray)) != UNIQUEREADWRITELOCK_MAXSLOTS)
+			void lock_write()  noexcept override
 			{
-				now = Clock::now();
+				bool flagArray[MAXSLOTS];
 
-				if (now >= absTime)
-				{
-					unmark_write(flagArray);
-					return false;
-				}
+				mark_write(flagArray);
 
-				std::this_thread::yield();
+				intptr_t nextCheckIndex = 0;
+
+				while ((nextCheckIndex = ready_count(nextCheckIndex, flagArray)) != MAXSLOTS)
+					std::this_thread::yield();
 			}
 
-			return true;
-		}
+			void unlock_write() noexcept override
+			{
+				for (intptr_t i = 0; i < MAXSLOTS; ++i)
+					rwLocks[i].unlock_write();
 
-		void lock_write() noexcept
+				flag.store(true, std::memory_order_release);
+			}
+
+			UniqueReadWriteLock(const UniqueReadWriteLock&) = delete;
+			UniqueReadWriteLock& operator=(const UniqueReadWriteLock&) = delete;
+		};
+
+		class ReadLockGuard
 		{
-			bool flagArray[UNIQUEREADWRITELOCK_MAXSLOTS];
+		private:
 
-			mark_write(flagArray);
+			SpinReadWriteLock& lock;
 
-			intptr_t nextCheckIndex = 0;
+		public:
 
-			while ((nextCheckIndex = ready_count(nextCheckIndex, flagArray)) != UNIQUEREADWRITELOCK_MAXSLOTS)
-				std::this_thread::yield();
-		}
+			explicit ReadLockGuard(SpinReadWriteLock& lock) noexcept : lock(lock)
+			{
+				lock.lock_read();
+			}
 
-		void unlock_write() noexcept
+			~ReadLockGuard() noexcept
+			{
+				lock.unlock_read();
+			}
+
+			ReadLockGuard(const ReadLockGuard&) = delete;
+			ReadLockGuard& operator=(const ReadLockGuard&) = delete;
+		};
+
+		class WriteLockGuard
 		{
-			for (intptr_t i = 0; i < UNIQUEREADWRITELOCK_MAXSLOTS; ++i)
-				rwLocks[i].unlock_write();
+		private:
 
-			flag.store(true, std::memory_order_release);
-		}
+			SpinReadWriteLock& lock;
 
-		UniqueReadWriteLock(const UniqueReadWriteLock&) = delete;
-		UniqueReadWriteLock& operator=(const UniqueReadWriteLock&) = delete;
-	};
+		public:
 
-	class ReadLockGuard
-	{
-	private:
+			explicit WriteLockGuard(SpinReadWriteLock& lock) noexcept : lock(lock)
+			{
+				lock.lock_write();
+			}
 
-		SpinReadWriteLock& lock;
+			~WriteLockGuard() noexcept
+			{
+				lock.unlock_write();
+			}
 
-	public:
+			WriteLockGuard(const WriteLockGuard&) = delete;
+			WriteLockGuard& operator=(const WriteLockGuard&) = delete;
+		};
 
-		explicit ReadLockGuard(SpinReadWriteLock& lock) noexcept : lock(lock)
+		class UniqueReadLockGuard
 		{
-			lock.lock_read();
-		}
+		private:
 
-		~ReadLockGuard() noexcept
+			UniqueReadLock& lock;
+
+		public:
+
+			explicit  UniqueReadLockGuard(UniqueReadLock& lock) noexcept : lock(lock)
+			{
+				lock.lock_read();
+			}
+
+			~UniqueReadLockGuard() noexcept
+			{
+				lock.unlock_read();
+			}
+
+			UniqueReadLockGuard(const  UniqueReadLockGuard&) = delete;
+			UniqueReadLockGuard& operator=(const  UniqueReadLockGuard&) = delete;
+		};
+
+		class UniqueWriteLockGuard
 		{
-			lock.unlock_read();
-		}
+		private:
 
-		ReadLockGuard(const ReadLockGuard&) = delete;
-		ReadLockGuard& operator=(const ReadLockGuard&) = delete;
-	};
+			UniqueReadWriteLockBase& lock;
 
-	class WriteLockGuard
-	{
-	private:
+		public:
 
-		SpinReadWriteLock& lock;
+			explicit UniqueWriteLockGuard(UniqueReadWriteLockBase& lock) noexcept : lock(lock)
+			{
+				lock.lock_write();
+			}
 
-	public:
+			~UniqueWriteLockGuard() noexcept
+			{
+				lock.unlock_write();
+			}
 
-		explicit WriteLockGuard(SpinReadWriteLock& lock) noexcept : lock(lock)
-		{
-			lock.lock_write();
-		}
+			UniqueWriteLockGuard(const UniqueWriteLockGuard&) = delete;
+			UniqueWriteLockGuard& operator=(const UniqueWriteLockGuard&) = delete;
+		};
+	}
 
-		~WriteLockGuard() noexcept
-		{
-			lock.unlock_write();
-		}
-
-		WriteLockGuard(const WriteLockGuard&) = delete;
-		WriteLockGuard& operator=(const WriteLockGuard&) = delete;
-	};
-
-	class UniqueReadLockGuard
-	{
-	private:
-
-		UniqueReadWriteLock::UniqueReadLock& lock;
-
-	public:
-
-		explicit  UniqueReadLockGuard(UniqueReadWriteLock::UniqueReadLock& lock) noexcept : lock(lock)
-		{
-			lock.lock_read();
-		}
-
-		~UniqueReadLockGuard() noexcept
-		{
-			lock.unlock_read();
-		}
-
-		UniqueReadLockGuard(const  UniqueReadLockGuard&) = delete;
-		UniqueReadLockGuard& operator=(const  UniqueReadLockGuard&) = delete;
-	};
-
-	class UniqueWriteLockGuard
-	{
-	private:
-
-		UniqueReadWriteLock& lock;
-
-	public:
-
-		explicit UniqueWriteLockGuard(UniqueReadWriteLock& lock) noexcept : lock(lock)
-		{
-			lock.lock_write();
-		}
-
-		~UniqueWriteLockGuard() noexcept
-		{
-			lock.unlock_write();
-		}
-
-		UniqueWriteLockGuard(const UniqueWriteLockGuard&) = delete;
-		UniqueWriteLockGuard& operator=(const UniqueWriteLockGuard&) = delete;
-	};
+	using INNER::SpinReadWriteLock;
+	using INNER::ReadLockGuard;
+	using INNER::WriteLockGuard;
+	using INNER::UniqueReadLock;
+	using INNER::UniqueReadWriteLock;
+	using INNER::UniqueReadLockGuard;
+	using INNER::UniqueWriteLockGuard;
 }
 
 
